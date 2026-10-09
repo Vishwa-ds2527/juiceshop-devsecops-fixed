@@ -1,0 +1,13 @@
+rules:
+  - id: express-trust-client-author-field
+    languages:
+      - javascript
+      - typescript
+    message: "Broken access control: review author is taken from client-supplied req.body.author instead of the authenticated session."
+    severity: ERROR
+    metadata:
+      cwe:
+        - "CWE-284: Improper Access Control"
+      owasp:
+        - "A01:2021 - Broken Access Control"
+    pattern-regex: "author\\s*:\\s*req\\.body\\.author"

@@ -1,0 +1,30 @@
+.git/
+.github/
+.semgrep-rules/
+.zap/
+node_modules/
+build/reports/
+dist/
+logs/
+coverage
+.nyc_output
+.env
+*.log
+
+# Not part of the running application - keeps the image small and, importantly,
+# keeps the intentionally vulnerable IaC samples (embedded private key) out of
+# the image that Trivy scans.
+infrastructure/
+monitoring/
+screenshots/
+test/
+vagrant/
+cypress.config.ts
+
+/bom.json
+/bom.xml
+
+# Pattern is *not covered* by node_modules/ above no matter what IntelliJ says!
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/

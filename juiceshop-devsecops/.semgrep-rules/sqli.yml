@@ -1,0 +1,13 @@
+rules:
+  - id: sequelize-template-literal-injection
+    languages: [javascript, typescript]
+    message: >
+      SQL injection: user input is interpolated into a Sequelize raw query
+      using template literals. Use parameterized queries with `replacements`.
+    severity: ERROR
+    metadata:
+      cwe:
+        - "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp:
+        - "A03:2021 - Injection"
+    pattern-regex: 'sequelize\.query\(\s*`[^`]*\$\{'

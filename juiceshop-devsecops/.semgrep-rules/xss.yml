@@ -1,0 +1,15 @@
+rules:
+  - id: angular-bypass-security-trust-html
+    languages: [typescript, javascript]
+    message: >
+      DOM-based XSS: user-controlled input is passed to
+      DomSanitizer.bypassSecurityTrustHtml(), which disables Angular's
+      built-in HTML sanitization. Remove the bypass and use template
+      interpolation ({{ }}) or Angular's default sanitization instead.
+    severity: ERROR
+    metadata:
+      cwe:
+        - "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp:
+        - "A03:2021 - Injection"
+    pattern: $SANITIZER.bypassSecurityTrustHtml(...)

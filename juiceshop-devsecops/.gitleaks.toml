@@ -1,0 +1,27 @@
+title = "Juice Shop DevSecOps - Gitleaks configuration"
+
+# Start from Gitleaks' full default ruleset...
+[extend]
+useDefault = true
+
+# ...and accept ONLY the credentials that OWASP Juice Shop contains on purpose.
+# Juice Shop is a deliberately vulnerable training application: it ships a
+# hard-coded JWT signing key, sample users, test fixtures and sample IaC files
+# that are part of its challenges. Without this allowlist the very first scan of
+# a fresh repository reports ~68 findings, all of them upstream training data.
+#
+# Anything committed OUTSIDE these paths (for example a fake AWS key added to
+# README.md) is still detected and fails the build.
+[allowlist]
+description = "Deliberate Juice Shop training credentials and test fixtures"
+paths = [
+  '''(^|/)lib/insecurity\.ts$''',          # hard-coded JWT key (intentional vulnerability)
+  '''(^|/)infrastructure/''',              # intentionally insecure Docker/Terraform challenge files
+  '''(^|/)data/static/users\.yml$''',      # seeded demo users
+  '''(^|/)test/''',                        # API, unit and Cypress test fixtures
+  '''\.spec\.ts$''',                       # Angular unit test fixtures
+]
+regexes = [
+  '''bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=''',      # OAuth challenge password in routes/login.ts
+  '''0x36435796Ca9be2bf150CE0dECc2D8Fab5C4d6E13''', # public crypto wallet address in the faucet page
+]

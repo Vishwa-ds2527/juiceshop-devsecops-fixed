@@ -144,7 +144,7 @@ export class SearchResultComponent implements OnDestroy, AfterViewInit {
         this.io.socket().emit('verifyLocalXssChallenge', queryParam)
       }) // vuln-code-snippet hide-end
       this.dataSource.filter = queryParam.toLowerCase()
-      this.searchValue = queryParam // FIXED: removed bypassSecurityTrustHtml
+      this.searchValue = queryParam // FIXED: removed bypassSecurityTrustHtml // vuln-code-snippet vuln-line localXssChallenge xssBonusChallenge
       if (this.gridDataSourceSubscription) {
         this.gridDataSourceSubscription.unsubscribe()
       }

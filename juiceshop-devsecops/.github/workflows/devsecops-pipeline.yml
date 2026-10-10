@@ -1,0 +1,193 @@
+name: DevSecOps CI/CD Pipeline
+
+# Build + test on every push, plus four security gates that run in parallel:
+#   1. SAST             - Semgrep, using the team's own rules in .semgrep-rules/
+#   2. Dependency scan  - npm audit (fails on High/Critical)
+#   3. Secrets scan     - Gitleaks (fails when a secret is found)
+#   4. Container scan   - Trivy against the built Docker image (fails on High/Critical)
+# Optional DAST (OWASP ZAP) runs only when started manually (Actions > Run workflow).
+
+on:
+  push:
+    branches: [ "main", "develop", "demo/**" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  NODE_VERSION: "24"
+  IMAGE_NAME: juiceshop-devsecops
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build & test
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      # Older npm 10.x releases crash on this project with
+      # "Cannot read properties of null (reading 'edgesOut')".
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      # postinstall also installs and builds the Angular frontend and compiles the server
+      - name: Install dependencies and build
+        run: npm ci
+
+      - name: Run server unit tests
+        run: npm run test:server
+
+  # ---------------------------------------------------------------------------
+  # Gate 1 - SAST (Semgrep with the team's custom rules)
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # BLOCKING: regression guard for the weaknesses the team already fixed
+      # (SQL injection, forged review author). --error makes the job fail if
+      # either rule matches, e.g. when someone reintroduces string-built SQL.
+      # data/static/codefixes holds Juice Shop's deliberately vulnerable
+      # challenge snippets, so it is excluded.
+      - name: Semgrep - rules for fixed weaknesses (blocking)
+        run: >
+          semgrep scan
+          --config .semgrep-rules/sqli.yml
+          --config .semgrep-rules/forged-author.yml
+          --exclude data/static/codefixes
+          --exclude test
+          --exclude node_modules
+          --exclude frontend/dist
+          --error
+          --metrics=off
+
+      # INFORMATIONAL: weaknesses that are known but not remediated yet
+      # (7 bypassSecurityTrustHtml call sites) plus the broader OWASP Top 10
+      # ruleset. Printed for the report, never blocks the build.
+      # To make XSS blocking too, delete the continue-on-error line.
+      - name: Semgrep - known open findings and OWASP Top 10 (informational)
+        continue-on-error: true
+        run: >
+          semgrep scan
+          --config .semgrep-rules/xss.yml
+          --config p/owasp-top-ten
+          --exclude data/static/codefixes
+          --exclude test
+          --exclude node_modules
+          --exclude frontend/dist
+          --error
+          --metrics=off
+
+  # ---------------------------------------------------------------------------
+  # Gate 2 - Dependency scan (npm audit reads the lockfiles, no install needed)
+  # ---------------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency Scan (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      # BLOCKING: exits non-zero when a High or Critical advisory exists.
+      - name: npm audit (fails on High/Critical)
+        run: npm audit --package-lock-only --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # Gate 3 - Secrets scan (Gitleaks)
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # BLOCKING: the action exits non-zero as soon as a secret is detected.
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Gate 4 - Container scan (Trivy against the built image)
+  # ---------------------------------------------------------------------------
+  container-scan:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      # BLOCKING: exit-code 1 fails the job on any High/Critical finding.
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ---------------------------------------------------------------------------
+  # Optional extra credit - DAST with OWASP ZAP (manual runs only)
+  # ---------------------------------------------------------------------------
+  dast-zap:
+    name: DAST (OWASP ZAP) [manual]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build and start the application
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:dast .
+          docker run -d --name juice-shop -p 3000:3000 ${{ env.IMAGE_NAME }}:dast
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000 > /dev/null && exit 0
+            sleep 5
+          done
+          docker logs juice-shop
+          exit 1
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: "http://localhost:3000"
+          allow_issue_writing: false
+          fail_action: false

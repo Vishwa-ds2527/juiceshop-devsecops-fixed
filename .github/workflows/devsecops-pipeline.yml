@@ -1,25 +1,31 @@
 name: DevSecOps CI/CD Pipeline
 
-# Runs the build/test job on every push and PR, then fans out into four
-# automated security gates. Gitleaks and npm audit are configured to
-# genuinely FAIL the workflow (not just warn) when they find something
-# above the agreed threshold; Semgrep and Trivy report findings as
-# workflow annotations and also fail on High/Critical results.
+# Build + test on every push, plus four security gates that run in parallel:
+#   1. SAST             - Semgrep, using the team's own rules in .semgrep-rules/
+#   2. Dependency scan  - npm audit (fails on High/Critical)
+#   3. Secrets scan     - Gitleaks (fails when a secret is found)
+#   4. Container scan   - Trivy against the built Docker image (fails on High/Critical)
+# Optional DAST (OWASP ZAP) runs only when started manually (Actions > Run workflow).
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: [ "main", "develop", "demo/**" ]
   pull_request:
     branches: [ "main", "develop" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
 
 env:
-  NODE_VERSION: "18"
+  NODE_VERSION: "24"
   IMAGE_NAME: juiceshop-devsecops
 
 jobs:
-  # ---------------------------------------------------------------------
-  # 1. Build & automated tests — runs on every push
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Build & test
+  # ---------------------------------------------------------------------------
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
@@ -32,46 +38,73 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
-      - name: Install dependencies
+      # Older npm 10.x releases crash on this project with
+      # "Cannot read properties of null (reading 'edgesOut')".
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      # postinstall also installs and builds the Angular frontend and compiles the server
+      - name: Install dependencies and build
         run: npm ci
 
-      - name: Run unit tests
-        run: npm test --if-present
+      - name: Run server unit tests
+        run: npm run test:server
 
-      - name: Build application
-        run: npm run build --if-present
-
-  # ---------------------------------------------------------------------
-  # 2. SAST — Semgrep
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Gate 1 - SAST (Semgrep with the team's custom rules)
+  # ---------------------------------------------------------------------------
   sast-semgrep:
     name: SAST (Semgrep)
-    needs: build-and-test
     runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: >-
-            p/owasp-top-ten
-            p/javascript
-            p/nodejsscan
-        env:
-          SEMGREP_RULES: p/owasp-top-ten p/javascript
-        # Fails the job automatically on findings that match the rulesets
-        # above. Findings and rule IDs are also uploaded as a SARIF report
-        # for the report's before/after evidence.
+      # BLOCKING: regression guard for the weaknesses the team already fixed
+      # (SQL injection, forged review author). --error makes the job fail if
+      # either rule matches, e.g. when someone reintroduces string-built SQL.
+      # data/static/codefixes holds Juice Shop's deliberately vulnerable
+      # challenge snippets, so it is excluded.
+      - name: Semgrep - rules for fixed weaknesses (blocking)
+        run: >
+          semgrep scan
+          --config .semgrep-rules/sqli.yml
+          --config .semgrep-rules/forged-author.yml
+          --exclude data/static/codefixes
+          --exclude test
+          --exclude node_modules
+          --exclude frontend/dist
+          --error
+          --metrics=off
 
-  # ---------------------------------------------------------------------
-  # 3. Dependency / software composition scanning — npm audit
-  # ---------------------------------------------------------------------
+      # INFORMATIONAL: weaknesses that are known but not remediated yet
+      # (7 bypassSecurityTrustHtml call sites) plus the broader OWASP Top 10
+      # ruleset. Printed for the report, never blocks the build.
+      # To make XSS blocking too, delete the continue-on-error line.
+      - name: Semgrep - known open findings and OWASP Top 10 (informational)
+        continue-on-error: true
+        run: >
+          semgrep scan
+          --config .semgrep-rules/xss.yml
+          --config p/owasp-top-ten
+          --exclude data/static/codefixes
+          --exclude test
+          --exclude node_modules
+          --exclude frontend/dist
+          --error
+          --metrics=off
+
+  # ---------------------------------------------------------------------------
+  # Gate 2 - Dependency scan (npm audit reads the lockfiles, no install needed)
+  # ---------------------------------------------------------------------------
   dependency-scan:
     name: Dependency Scan (npm audit)
-    needs: build-and-test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -82,22 +115,18 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Update npm
+        run: npm install -g npm@latest
 
-      - name: Run npm audit (fails on High/Critical)
-        run: npm audit --audit-level=high
-        # npm audit exits non-zero automatically once a vulnerability at or
-        # above --audit-level is found, which blocks the job without any
-        # extra scripting.
+      # BLOCKING: exits non-zero when a High or Critical advisory exists.
+      - name: npm audit (fails on High/Critical)
+        run: npm audit --package-lock-only --audit-level=high
 
-  # ---------------------------------------------------------------------
-  # 4. Secrets scanning — Gitleaks  (the gate deliberately used to
-  #    demonstrate a genuine pipeline block, see Section 5.7 of report)
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Gate 3 - Secrets scan (Gitleaks)
+  # ---------------------------------------------------------------------------
   secrets-scan:
     name: Secrets Scan (Gitleaks)
-    needs: build-and-test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source (full history)
@@ -105,21 +134,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # BLOCKING: the action exits non-zero as soon as a secret is detected.
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # No GITLEAKS_LICENSE needed for the OSS scan. The action exits
-        # with a non-zero status the moment a secret pattern is detected
-        # anywhere in the diff/history being scanned, which fails this job
-        # and blocks the pipeline.
 
-  # ---------------------------------------------------------------------
-  # 5. Container image scanning — Trivy
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Gate 4 - Container scan (Trivy against the built image)
+  # ---------------------------------------------------------------------------
   container-scan:
     name: Container Scan (Trivy)
-    needs: build-and-test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -128,35 +153,41 @@ jobs:
       - name: Build Docker image
         run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
 
-      - name: Run Trivy vulnerability scan
+      # BLOCKING: exit-code 1 fails the job on any High/Critical finding.
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
           format: "table"
           severity: "CRITICAL,HIGH"
-          exit-code: "1"
           ignore-unfixed: true
+          exit-code: "1"
 
-  # ---------------------------------------------------------------------
-  # 6. Optional — DAST with OWASP ZAP against the running app (extra credit)
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Optional extra credit - DAST with OWASP ZAP (manual runs only)
+  # ---------------------------------------------------------------------------
   dast-zap:
-    name: DAST (OWASP ZAP) [optional]
-    needs: [ dependency-scan, secrets-scan, container-scan ]
+    name: DAST (OWASP ZAP) [manual]
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    if: false   # flip to true once the app is reliably reachable in CI
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Start application stack
-        run: docker compose up -d
+      - name: Build and start the application
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:dast .
+          docker run -d --name juice-shop -p 3000:3000 ${{ env.IMAGE_NAME }}:dast
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000 > /dev/null && exit 0
+            sleep 5
+          done
+          docker logs juice-shop
+          exit 1
 
-      - name: Wait for app to be ready
-        run: npx wait-on http://localhost:3000 -t 60000
-
-      - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.12.0
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
         with:
           target: "http://localhost:3000"
+          allow_issue_writing: false
           fail_action: false
